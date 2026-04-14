@@ -1,9 +1,10 @@
 const express = require('express');
-const { makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const archiver = require('archiver');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { Boom } = require('@hapi/boom');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -69,6 +70,11 @@ const HTML = `<!DOCTYPE html>
                         statusDiv.innerHTML = '✅ Session ID sent to your WhatsApp inbox! Check your WhatsApp now.';
                         pairBtn.disabled = false;
                         pairBtn.innerHTML = '🔗 Pair Device';
+                    } else if (result.error) {
+                        clearInterval(interval);
+                        statusDiv.innerHTML = '❌ ' + result.error;
+                        pairBtn.disabled = false;
+                        pairBtn.innerHTML = '🔗 Pair Device';
                     }
                 }, 3000);
             } else {
@@ -91,43 +97,64 @@ app.get('/', (req, res) => res.send(HTML));
 app.post('/api/pair', async (req, res) => {
     const phone = req.body.phone?.replace(/[^0-9]/g, '');
     if (!phone) return res.status(400).json({ error: 'Invalid number' });
+    
     const sessionDir = path.join(os.tmpdir(), `zxd_${phone}_${Date.now()}`);
     fs.mkdirSync(sessionDir, { recursive: true });
-    sessions.set(phone, { sessionDir, status: 'pending' });
+    
     try {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
-            browser: ['ZeroTraceXD Pair', 'Chrome', '122.0.0.0'],
-            logger: require('pino')({ level: 'silent' })
+            browser: ['ZeroTrace XD', 'Safari', '15.0'], // more compatible
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
+            logger: require('pino')({ level: 'silent' }),
+            connectTimeoutMs: 30000,
+            defaultQueryTimeoutMs: 30000
         });
+        
         sock.ev.on('creds.update', saveCreds);
-        let codeSent = false;
-        const codePromise = new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('Timeout')), 20000);
+        
+        // Wait for connection to be open
+        let isOpen = false;
+        let code = null;
+        
+        const connectionPromise = new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('Connection timeout')), 30000);
+            
             sock.ev.on('connection.update', async (update) => {
-                if (update.connection === 'open' && !codeSent) {
+                console.log('[PAIR] Connection update:', update);
+                const { connection, lastDisconnect } = update;
+                
+                if (connection === 'open' && !isOpen) {
+                    isOpen = true;
                     clearTimeout(timeout);
-                    codeSent = true;
                     try {
-                        const code = await sock.requestPairingCode(phone);
+                        console.log('[PAIR] Requesting pairing code for', phone);
+                        code = await sock.requestPairingCode(phone);
+                        console.log('[PAIR] Code received:', code);
                         sessions.set(phone, { sessionDir, status: 'waiting', sock });
                         resolve(code);
                     } catch (err) {
                         reject(err);
                     }
-                } else if (update.connection === 'close') {
+                } else if (connection === 'close') {
                     clearTimeout(timeout);
-                    reject(new Error('Connection closed'));
+                    const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+                    if (!shouldReconnect) reject(new Error('Connection closed by WhatsApp'));
+                    else reject(new Error('Connection closed unexpectedly'));
                 }
             });
         });
-        const code = await codePromise;
-        res.json({ code });
+        
+        const pairCode = await connectionPromise;
+        res.json({ code: pairCode });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        console.error('[PAIR] Error:', err);
+        // Clean up
+        if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+        res.status(500).json({ error: err.message || 'Pairing failed' });
     }
 });
 
@@ -138,16 +165,21 @@ app.get('/api/check-session', async (req, res) => {
     const { sessionDir, sock } = entry;
     const credsPath = path.join(sessionDir, 'creds.json');
     if (fs.existsSync(credsPath)) {
-        const zipBuffer = await packageSession(sessionDir);
-        const sessionId = zipBuffer.toString('base64');
-        if (sock && sock.user) {
-            const userJid = phone + '@s.whatsapp.net';
-            await sock.sendMessage(userJid, { text: `🎉 *Zero Trace XD Session ID*\n\nCopy the text below and save it securely. You will paste it into your bot's environment variable.\n\n\`\`\`\n${sessionId}\n\`\`\`` });
-            await sock.logout();
+        try {
+            const zipBuffer = await packageSession(sessionDir);
+            const sessionId = zipBuffer.toString('base64');
+            if (sock && sock.user) {
+                const userJid = phone + '@s.whatsapp.net';
+                await sock.sendMessage(userJid, { text: `🎉 *Zero Trace XD Session ID*\n\nCopy the text below and save it securely. You will paste it into your bot's environment variable.\n\n\`\`\`\n${sessionId}\n\`\`\`` });
+                await sock.logout();
+            }
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+            sessions.delete(phone);
+            return res.json({ ready: true });
+        } catch (err) {
+            console.error('[CHECK] Error packaging session:', err);
+            return res.json({ error: err.message });
         }
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-        sessions.delete(phone);
-        return res.json({ ready: true });
     }
     res.json({ ready: false });
 });
@@ -161,4 +193,4 @@ async function packageSession(dir) {
     return Buffer.concat(chunks);
 }
 
-app.listen(PORT, () => console.log(`Pairing server on port ${PORT}`));
+app.listen(PORT, () => console.log(`Pairing server running on port ${PORT}`));
